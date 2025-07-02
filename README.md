@@ -132,6 +132,6 @@ echo 'use somo' >> ~/.config/elvish/rc.elv
 ## 🖥️ Platform Support:
 Somo currently supports:
 - Linux: Full support using the procfs library
-- macOS: Full support using netstat2 and libproc libraries
+- macOS: Full support using libc and libproc libraries
 
 We welcome contributions to extend support to other platforms!
