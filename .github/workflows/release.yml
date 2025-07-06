@@ -54,15 +54,50 @@ jobs:
     
   build-and-release:
     needs: version-check
+    strategy:
+      matrix:
+        include:
+          # Linux builds
+          - os: ubuntu-latest
+            artifact_name: somo-linux-deb
+            package_format: deb
+            distro: debian
+          - os: ubuntu-latest
+            artifact_name: somo-linux-rpm
+            package_format: rpm
+            distro: fedora
+          - os: ubuntu-latest
+            artifact_name: somo-linux-generic
+            package_format: tar.gz
+            distro: generic
+          # macOS builds - x86_64 and arm64
+          - os: macos-latest
+            artifact_name: somo-macos-x86_64
+            package_format: tar.gz
+            distro: macos
+            arch: x86_64
+          - os: macos-latest
+            artifact_name: somo-macos-arm64
+            package_format: tar.gz
+            distro: macos
+            arch: arm64
 
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+        target: ${{ matrix.arch == 'arm64' && 'aarch64-apple-darwin' || matrix.os == 'macos-latest' && 'x86_64-apple-darwin' || '' }}
+
     - name: Extract version from Cargo.toml
       id: version
       run: echo "version=$(grep -Po '^version = \"\K[^\"]+' Cargo.toml)" >> "$GITHUB_OUTPUT"
+      shell: bash
 
     - name: Extract changelog entry
       id: changelog
@@ -77,42 +112,262 @@ jobs:
         echo "changelog<<EOF" >> $GITHUB_OUTPUT
         echo "$content" >> $GITHUB_OUTPUT
         echo "EOF" >> $GITHUB_OUTPUT
+      shell: bash
 
-    - name: Build and package
+    # Build with architecture-specific settings for macOS
+    - name: Build macOS binary (x86_64)
+      if: matrix.os == 'macos-latest' && matrix.arch == 'x86_64'
+      uses: actions-rs/cargo@v1
+      with:
+        command: build
+        args: --release --target x86_64-apple-darwin
+      env:
+        MACOSX_DEPLOYMENT_TARGET: "10.13"
+
+    - name: Build macOS binary (arm64)
+      if: matrix.os == 'macos-latest' && matrix.arch == 'arm64'
+      uses: actions-rs/cargo@v1
+      with:
+        command: build
+        args: --release --target aarch64-apple-darwin
+      env:
+        MACOSX_DEPLOYMENT_TARGET: "11.0"
+
+    # Linux build commands
+    - name: Build Linux release binary
+      if: matrix.os == 'ubuntu-latest'
+      uses: actions-rs/cargo@v1
+      with:
+        command: build
+        args: --release
+
+    # Debian package (.deb)
+    - name: Package DEB (Debian/Ubuntu)
+      if: matrix.package_format == 'deb'
       run: |
-        cargo build --release
         cargo install cargo-deb
         cargo deb --output target/debian/somo-${{ steps.version.outputs.version }}.deb
 
-    - name: Upload Artifact
+    # RPM package (.rpm)
+    - name: Install RPM build dependencies
+      if: matrix.package_format == 'rpm'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y rpm
+
+    - name: Package RPM (RHEL/Fedora)
+      if: matrix.package_format == 'rpm'
+      run: |
+        cargo install cargo-rpm
+        cargo rpm init
+        cargo rpm build
+        mkdir -p target/rpm
+        cp target/release/rpmbuild/RPMS/*/*.rpm target/rpm/somo-${{ steps.version.outputs.version }}.rpm
+
+    # Generic Linux package (.tar.gz)
+    - name: Package Generic Linux binary
+      if: matrix.package_format == 'tar.gz' && matrix.distro == 'generic'
+      run: |
+        cd target/release
+        tar -czf ../somo-${{ steps.version.outputs.version }}-linux-generic.tar.gz somo
+        cd ../..
+
+    # macOS package (.tar.gz) - x86_64
+    - name: Package macOS binary (x86_64)
+      if: matrix.os == 'macos-latest' && matrix.arch == 'x86_64'
+      run: |
+        cd target/x86_64-apple-darwin/release
+        tar -czf ../../somo-${{ steps.version.outputs.version }}-macos-x86_64.tar.gz somo
+        cd ../../..
+
+    # macOS package (.tar.gz) - arm64
+    - name: Package macOS binary (arm64)
+      if: matrix.os == 'macos-latest' && matrix.arch == 'arm64'
+      run: |
+        cd target/aarch64-apple-darwin/release
+        tar -czf ../../somo-${{ steps.version.outputs.version }}-macos-arm64.tar.gz somo
+        cd ../../..
+
+    # macOS universal binary creation
+    - name: Create universal macOS binary
+      if: matrix.os == 'macos-latest' && matrix.arch == 'x86_64'
+      run: |
+        # First, we need to make sure the arm64 job has completed and we have access to the artifacts
+        # This will be handled through the publish job that merges the artifacts
+        mkdir -p target/universal-apple-darwin/release
+        lipo -create \
+          target/x86_64-apple-darwin/release/somo \
+          -output target/universal-apple-darwin/release/somo
+        # We'll need to download the arm64 artifact in the publish job to complete the universal binary
+
+    # Upload artifacts based on platform
+    - name: Upload DEB Artifact
+      if: matrix.package_format == 'deb'
       uses: actions/upload-artifact@v4
       with:
-        name: somo-${{ steps.version.outputs.version }}-${{ github.run_number }}-${{ github.sha }}.deb
+        name: somo-${{ steps.version.outputs.version }}-debian-${{ github.run_number }}.deb
         path: target/debian/somo-${{ steps.version.outputs.version }}.deb
 
-    - name: Publish to Crates.io
-      run: cargo publish
-      env:
-        CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
-
-    - name: Create Release
-      uses: actions/create-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Upload RPM Artifact
+      if: matrix.package_format == 'rpm'
+      uses: actions/upload-artifact@v4
       with:
-        tag_name: v${{ steps.version.outputs.version }}
-        release_name: 🎉 Somo Release ${{ steps.version.outputs.version }}
-        body: ${{ steps.changelog.outputs.changelog }}
-        draft: false
-        prerelease: false
-      id: create_release
+        name: somo-${{ steps.version.outputs.version }}-rpm-${{ github.run_number }}.rpm
+        path: target/rpm/somo-${{ steps.version.outputs.version }}.rpm
 
-    - name: Upload Release Asset
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Upload Generic Linux Artifact
+      if: matrix.package_format == 'tar.gz' && matrix.distro == 'generic'
+      uses: actions/upload-artifact@v4
       with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: target/debian/somo-${{ steps.version.outputs.version }}.deb
-        asset_name: somo-${{ steps.version.outputs.version }}-${{ github.run_number }}-${{ github.sha }}.deb
-        asset_content_type: application/x-debian-package
+        name: somo-${{ steps.version.outputs.version }}-linux-generic-${{ github.run_number }}.tar.gz
+        path: target/somo-${{ steps.version.outputs.version }}-linux-generic.tar.gz
+
+    - name: Upload macOS x86_64 Artifact
+      if: matrix.os == 'macos-latest' && matrix.arch == 'x86_64'
+      uses: actions/upload-artifact@v4
+      with:
+        name: somo-${{ steps.version.outputs.version }}-macos-x86_64-${{ github.run_number }}.tar.gz
+        path: target/somo-${{ steps.version.outputs.version }}-macos-x86_64.tar.gz
+
+    - name: Upload macOS arm64 Artifact
+      if: matrix.os == 'macos-latest' && matrix.arch == 'arm64'
+      uses: actions/upload-artifact@v4
+      with:
+        name: somo-${{ steps.version.outputs.version }}-macos-arm64-${{ github.run_number }}.tar.gz
+        path: target/somo-${{ steps.version.outputs.version }}-macos-arm64.tar.gz
+
+  publish:
+    needs: build-and-release
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract version from Cargo.toml
+        id: version
+        run: echo "version=$(grep -Po '^version = \"\K[^\"]+' Cargo.toml)" >> "$GITHUB_OUTPUT"
+
+      - name: Extract changelog entry
+        id: changelog
+        run: |
+          version=${{ steps.version.outputs.version }}
+          content=$(awk -v ver="$version" '
+            $0 ~ "^## \\["ver"\\]" { found = 1; print; next }
+            found && /^---$/ { exit }
+            found { print }
+          ' CHANGELOG.md)
+
+          echo "changelog<<EOF" >> $GITHUB_OUTPUT
+          echo "$content" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # Create universal macOS binary
+      - name: Create Universal macOS binary
+        run: |
+          mkdir -p target/universal/
+          # Extract both architecture binaries
+          mkdir -p target/x86_64 target/arm64
+          tar -xzf artifacts/somo-${{ steps.version.outputs.version }}-macos-x86_64-${{ github.run_number }}.tar.gz/somo-${{ steps.version.outputs.version }}-macos-x86_64.tar.gz -C target/x86_64
+          tar -xzf artifacts/somo-${{ steps.version.outputs.version }}-macos-arm64-${{ github.run_number }}.tar.gz/somo-${{ steps.version.outputs.version }}-macos-arm64.tar.gz -C target/arm64
+          
+          # Create universal binary
+          mkdir -p target/universal/
+          lipo -create \
+            target/x86_64/somo \
+            target/arm64/somo \
+            -output target/universal/somo
+          
+          # Package universal binary
+          cd target/universal/
+          tar -czf ../somo-${{ steps.version.outputs.version }}-macos-universal.tar.gz somo
+          cd ../..
+
+      - name: Publish to Crates.io
+        uses: actions-rs/cargo@v1
+        with:
+          command: publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+
+      - name: Create Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          release_name: 🎉 Somo Release ${{ steps.version.outputs.version }}
+          body: ${{ steps.changelog.outputs.changelog }}
+          draft: false
+          prerelease: false
+        id: create_release
+
+      - name: Upload Debian Package
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: artifacts/somo-${{ steps.version.outputs.version }}-debian-${{ github.run_number }}.deb/somo-${{ steps.version.outputs.version }}.deb
+          asset_name: somo-${{ steps.version.outputs.version }}-debian.deb
+          asset_content_type: application/x-debian-package
+
+      - name: Upload RPM Package
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: artifacts/somo-${{ steps.version.outputs.version }}-rpm-${{ github.run_number }}.rpm/somo-${{ steps.version.outputs.version }}.rpm
+          asset_name: somo-${{ steps.version.outputs.version }}-rpm.rpm
+          asset_content_type: application/x-rpm
+
+      - name: Upload Generic Linux Package
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: artifacts/somo-${{ steps.version.outputs.version }}-linux-generic-${{ github.run_number }}.tar.gz/somo-${{ steps.version.outputs.version }}-linux-generic.tar.gz
+          asset_name: somo-${{ steps.version.outputs.version }}-linux-generic.tar.gz
+          asset_content_type: application/gzip
+
+      - name: Upload macOS x86_64 Package
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: artifacts/somo-${{ steps.version.outputs.version }}-macos-x86_64-${{ github.run_number }}.tar.gz/somo-${{ steps.version.outputs.version }}-macos-x86_64.tar.gz
+          asset_name: somo-${{ steps.version.outputs.version }}-macos-x86_64.tar.gz
+          asset_content_type: application/gzip
+
+      - name: Upload macOS arm64 Package
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: artifacts/somo-${{ steps.version.outputs.version }}-macos-arm64-${{ github.run_number }}.tar.gz/somo-${{ steps.version.outputs.version }}-macos-arm64.tar.gz
+          asset_name: somo-${{ steps.version.outputs.version }}-macos-arm64.tar.gz
+          asset_content_type: application/gzip
+
+      - name: Upload macOS Universal Package
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: target/somo-${{ steps.version.outputs.version }}-macos-universal.tar.gz
+          asset_name: somo-${{ steps.version.outputs.version }}-macos-universal.tar.gz
+          asset_content_type: application/gzip
